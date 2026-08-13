@@ -1,0 +1,13 @@
+mqtt:
+  server: tcp://mosquitto:1883
+  topic_path: sensors/+/value
+  device_id_regex: "sensors/(?P<deviceid>.*)/value"
+
+cache:
+  timeout: 5m
+
+metrics:
+  - prom_name: photoresistance_value
+    mqtt_name: value
+    help: "Valeur brute lue par la photorésistance"
+    type: gauge
