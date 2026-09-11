@@ -1,0 +1,2 @@
+sudo nmcli device wifi hotspot ifname wlp3s0 ssid LALAINA password "Mihasoa++"
+sudo nmcli con down Hotspot

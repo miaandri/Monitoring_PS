@@ -1,118 +1,81 @@
-import re
 import time
 import paho.mqtt.client as mqtt
-from prometheus_client import start_http_server, Gauge, Counter
+from prometheus_client import start_http_server, Gauge
 
-# ============================================================================
-# PARAMÈTRES DE MODÉLISATION DU PARC SOLAIRE
-# ============================================================================
-PANEL_NOMINAL_POWER_W = 300.0  # Puissance crête par panneau (300 Wc)
-INVERTER_EFFICIENCY = 0.96     # Rendement de l'onduleur (96%)
-THERMAL_LOSS_FACTOR = 0.90     # Pertes thermiques en plein soleil (10%)
-INVERTER_THRESHOLD = 5.0       # Seuil d'allumage de l'onduleur (5% de luminosité)
+# --- CONFIGURATION ---
+# Si le script tourne dans Docker, l'hôte est le nom du service "mosquitto"
+# S'il tourne directement sur votre PC, remplacez par "localhost"
+MQTT_BROKER = "mosquitto" 
+MQTT_PORT = 1883
+MQTT_TOPIC = "parc_solaire/+/luminosite" # Le '+' permet d'écouter tous les panneaux
 
-# Stockage interne de l'état des panneaux
-panel_powers = {}
-last_energy_update_time = time.time()
+# Définition de la puissance maximale d'un panneau (ex: 250 Watts)
+MAX_POWER_PER_PANEL = 250.0 
 
-# ============================================================================
-# MÉTRIQUES PROMETHEUS
-# ============================================================================
-# 1. Luminosité brute (0 à 100%)
-SOLAR_LUMINOSITY = Gauge(
-    'solar_panel_luminosity_percent',
-    'Luminosite mesurée par la photoresistance (0 a 100%)',
-    ['panel_id']
-)
+# --- MÉTRIQUES PROMETHEUS ---
+# Les 'labels' (étiquettes) permettent de différencier les panneaux dans Grafana
+LUMINOSITY_GAUGE = Gauge('solar_panel_luminosity_percent', 'Luminosité mesurée (%)', ['panel'])
+POWER_GAUGE = Gauge('solar_panel_power_watts', 'Puissance estimée (W)', ['panel'])
+TOTAL_POWER_GAUGE = Gauge('solar_park_total_power_watts', 'Puissance totale du parc (W)')
 
-# 2. Puissance DC individuelle calculée (en Watts)
-SOLAR_PANEL_POWER = Gauge(
-    'solar_panel_power_watts',
-    'Puissance DC calculee par panneau en Watts',
-    ['panel_id']
-)
+# Dictionnaire pour garder en mémoire la dernière puissance de chaque panneau
+current_power = {"1": 0.0, "2": 0.0}
 
-# 3. Puissance AC globale produite par le parc (en Watts)
-SOLAR_PARK_TOTAL_POWER = Gauge(
-    'solar_park_total_power_watts',
-    'Puissance AC totale produite par le parc en Watts'
-)
-
-# 4. Énergie totale cumulée (en kWh)
-SOLAR_PARK_ENERGY_KWH = Counter(
-    'solar_park_energy_kwh_total',
-    'Energie totale produite par le parc en kWh'
-)
-
-
-def update_park_energy():
-    """Calcule et accumule l'énergie produite (en kWh) en fonction du temps écoulé."""
-    global last_energy_update_time
-
-    current_time = time.time()
-    dt = current_time - last_energy_update_time
-    last_energy_update_time = current_time
-
-    total_power_ac = sum(panel_powers.values())
-    SOLAR_PARK_TOTAL_POWER.set(total_power_ac)
-
-    # Convertit les Watts.secondes en kWh : (P * dt) / 3600000
-    if total_power_ac > 0 and dt > 0:
-        energy_kwh = (total_power_ac * dt) / 3600000.0
-        SOLAR_PARK_ENERGY_KWH.inc(energy_kwh)
-
-
+# --- FONCTIONS MQTT ---
 def on_connect(client, userdata, flags, rc):
-    print(f"[MQTT] Connecté au Broker avec le code : {rc}")
-    client.subscribe("parc_solaire/+/luminosite")
-
+    if rc == 0:
+        print("Connecté avec succès au broker Mosquitto !")
+        client.subscribe(MQTT_TOPIC)
+    else:
+        print(f"Échec de la connexion, code : {rc}")
 
 def on_message(client, userdata, msg):
     try:
-        topic = msg.topic
+        # msg.topic ressemble à "parc_solaire/panneau_1/luminosite"
+        # On découpe la chaîne pour extraire le numéro du panneau
+        parts = msg.topic.split('/')
+        panel_id = parts[1].split('_')[1] # Récupère "1" ou "2"
+
+        # Récupération de la luminosité
         luminosity = float(msg.payload.decode('utf-8'))
-
-        match = re.search(r'parc_solaire/(panneau_\d+)/luminosite', topic)
-        if match:
-            panel_id = match.group(1)
-
-            # --- TRAITEMENT 1 : Luminosité brute (0-100%) ---
-            SOLAR_LUMINOSITY.labels(panel_id=panel_id).set(luminosity)
-
-            # --- TRAITEMENT 2 : Puissance DC individuelle ---
-            power_dc = PANEL_NOMINAL_POWER_W * (luminosity / 100.0)
-            SOLAR_PANEL_POWER.labels(panel_id=panel_id).set(power_dc)
-
-            # --- TRAITEMENT 3 : Puissance AC avec rendement et pertes ---
-            if luminosity >= INVERTER_THRESHOLD:
-                power_ac = power_dc * INVERTER_EFFICIENCY * THERMAL_LOSS_FACTOR
-            else:
-                power_ac = 0.0
-
-            panel_powers[panel_id] = power_ac
-
-            # --- TRAITEMENT 4 : Mise à jour globale & Énergie ---
-            update_park_energy()
-
-            print(
-                f"[METRIC] {panel_id} | Lum: {luminosity:.1f}% | "
-                f"P_DC: {power_dc:.1f}W | P_AC: {power_ac:.1f}W"
-            )
-
+        
+        # --- CALCUL DE LA PUISSANCE ---
+        # Simulation basique : Puissance = (Luminosité / 100) * Puissance_Max
+        power = (luminosity / 100.0) * MAX_POWER_PER_PANEL
+        
+        # Mise à jour des jauges individuelles pour ce panneau
+        LUMINOSITY_GAUGE.labels(panel=panel_id).set(luminosity)
+        POWER_GAUGE.labels(panel=panel_id).set(power)
+        
+        # Calcul et mise à jour de la puissance totale du parc
+        current_power[panel_id] = power
+        total_power = sum(current_power.values())
+        TOTAL_POWER_GAUGE.set(total_power)
+        
+        print(f"Panneau {panel_id} : {luminosity}% -> {power:.1f}W | Total Parc: {total_power:.1f}W")
+        
     except Exception as e:
-        print(f"[ERREUR] Impossible de parser le message : {e}")
+        print(f"Erreur lors du traitement du message : {e}")
 
-
+# --- LANCEMENT ---
 if __name__ == '__main__':
-    # Démarre le serveur HTTP Prometheus sur le port 8000
+    # Démarre le serveur web Prometheus sur le port 8000
     start_http_server(8000)
-    print("[PROMETHEUS] Serveur de métriques prêt sur http://localhost:8000/metrics")
-
+    print("Serveur Prometheus prêt sur le port 8000. En attente de MQTT...")
+    
+    # Configuration du client MQTT
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
-
-    time.sleep(2)
-    # Si le script tourne dans Docker avec mosquitto, mettez "mosquitto" en host, sinon "localhost"
-    client.connect("mosquitto", 1883, 60)
+    
+    # Boucle de tentative de connexion (utile si Mosquitto démarre en même temps)
+    while True:
+        try:
+            client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            break
+        except Exception:
+            print("Broker MQTT introuvable, nouvelle tentative dans 5 secondes...")
+            time.sleep(5)
+            
+    # Laisse le script tourner en boucle
     client.loop_forever()
